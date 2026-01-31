@@ -1,2 +1,4 @@
 /target
 .direnv/
+/.idea
+/impl_from_tuple
