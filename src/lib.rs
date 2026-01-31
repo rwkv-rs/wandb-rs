@@ -156,6 +156,9 @@ pub enum ApiError {
 
     #[error("no response from query")]
     NoResponse(String),
+
+    #[error("log thread failed: {0}")]
+    LogThreadJoin(#[from] tokio::task::JoinError),
 }
 
 impl WandB {
