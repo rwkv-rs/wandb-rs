@@ -1,20 +1,15 @@
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
-use reqwest::StatusCode;
 use serde::Serialize;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{error, info, warn};
 
 use crate::{data_value::LogData, ApiError, ReqwestBadResponse};
 
-const LOG_BATCH_SIZE: usize = 128;
-const LOG_RETRY_MAX: usize = 5;
-const LOG_RETRY_BASE_DELAY_MS: u64 = 200;
-const LOG_RETRY_MAX_DELAY_MS: u64 = 5_000;
+const LOG_BATCH_SIZE: usize = 64;
 
 pub struct Run {
     tx_log_data: mpsc::Sender<RunMessage>,
-    log_thread: Option<JoinHandle<Result<(), ApiError>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,14 +35,13 @@ async fn submit_log(
 
     let mut content = Vec::with_capacity(rows.len());
     for row in rows {
-        let mut line = serde_json::to_string(row)?;
-        line.push('\n');
-        content.push(line);
+        content.push(serde_json::to_string(row)?);
     }
 
-    let summary_row = serde_json::to_string(
-        rows.last().expect("rows should not be empty"),
-    )?;
+    let summary_row = content
+        .last()
+        .expect("content should not be empty")
+        .clone();
 
     let log = FsFilesData {
         files: [
@@ -70,70 +64,14 @@ async fn submit_log(
         .collect(),
     };
 
-    let mut retries = 0;
-    loop {
-        let response = client.post(run_path).json(&log).send().await;
-        match response {
-            Ok(response) => match response.maybe_err().await {
-                Ok(_) => return Ok(()),
-                Err(err) => {
-                    let api_error = ApiError::from(err);
-                    if retries >= LOG_RETRY_MAX || !should_retry(&api_error) {
-                        return Err(api_error);
-                    }
-                    let delay = retry_delay(retries);
-                    warn!(
-                        "Log batch upload failed (attempt {}/{}), retrying in {:?}: {}",
-                        retries + 1,
-                        LOG_RETRY_MAX,
-                        delay,
-                        api_error
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-            },
-            Err(err) => {
-                let api_error = ApiError::from(err);
-                if retries >= LOG_RETRY_MAX || !should_retry(&api_error) {
-                    return Err(api_error);
-                }
-                let delay = retry_delay(retries);
-                warn!(
-                    "Log batch upload failed (attempt {}/{}), retrying in {:?}: {}",
-                    retries + 1,
-                    LOG_RETRY_MAX,
-                    delay,
-                    api_error
-                );
-                tokio::time::sleep(delay).await;
-            }
-        }
-        retries += 1;
-    }
-}
-
-fn should_retry(error: &ApiError) -> bool {
-    match error {
-        ApiError::RequestErrorWithBody(err) => should_retry_reqwest_error(&err.error),
-        ApiError::RequestFailed(err) => should_retry_reqwest_error(err),
-        _ => false,
-    }
-}
-
-fn should_retry_reqwest_error(error: &reqwest::Error) -> bool {
-    if error.is_timeout() || error.is_connect() {
-        return true;
-    }
-    error
-        .status()
-        .map(|status| status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
-        .unwrap_or(false)
-}
-
-fn retry_delay(retries: usize) -> Duration {
-    let exp = retries.min(6) as u32;
-    let delay_ms = LOG_RETRY_BASE_DELAY_MS.saturating_mul(1u64 << exp);
-    Duration::from_millis(delay_ms.min(LOG_RETRY_MAX_DELAY_MS))
+    client
+        .post(run_path)
+        .json(&log)
+        .send()
+        .await?
+        .maybe_err()
+        .await?;
+    Ok(())
 }
 
 enum RunMessage {
@@ -159,46 +97,31 @@ impl Run {
                     RunMessage::LogData(row) => {
                         buffer.push(row);
                         if buffer.len() >= LOG_BATCH_SIZE {
-                            let batch_len = buffer.len() as u64;
+                            let batch = std::mem::take(&mut buffer);
                             if let Err(log_error) =
-                                submit_log(&client, &run_path, step, &buffer).await
+                                submit_log(&client, &run_path, step, &batch).await
                             {
                                 error!(
                                     "Failed to log batch to WandB for step {step}: {log_error}"
                                 );
-                            } else {
-                                step += batch_len;
-                                buffer.clear();
                             }
+                            step += batch.len() as u64;
                         }
                     }
                 }
             }
             if !buffer.is_empty() {
-                let batch_len = buffer.len() as u64;
-                if let Err(log_error) = submit_log(&client, &run_path, step, &buffer).await {
+                let batch = std::mem::take(&mut buffer);
+                if let Err(log_error) = submit_log(&client, &run_path, step, &batch).await {
                     error!("Failed to log batch to WandB for step {step}: {log_error}");
-                } else {
-                    step += batch_len;
-                    buffer.clear();
                 }
+                step += batch.len() as u64;
             }
             info!("WandB run {name} ended.");
             Ok(())
         });
-        Run {
-            tx_log_data,
-            log_thread: Some(log_thread),
-        }
-    }
-
-    pub async fn finish(mut self) -> Result<(), ApiError> {
-        let log_thread = self.log_thread.take();
-        drop(self.tx_log_data);
-        if let Some(log_thread) = log_thread {
-            log_thread.await??;
-        }
-        Ok(())
+        drop(log_thread);
+        Run { tx_log_data }
     }
 
     /// Upload run data.
@@ -275,28 +198,6 @@ impl Run {
     async fn _log(&self, row: LogData) {
         if let Err(e) = self.tx_log_data.send(RunMessage::LogData(row)).await {
             warn!("Failed to send log data to wandb: {}", e);
-        }
-    }
-}
-
-impl Drop for Run {
-    fn drop(&mut self) {
-        if let Some(log_thread) = self.log_thread.take() {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    match log_thread.await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => {
-                            error!("WandB log thread failed: {err}");
-                        }
-                        Err(err) => {
-                            error!("WandB log thread panicked: {err}");
-                        }
-                    }
-                });
-            } else {
-                log_thread.abort();
-            }
         }
     }
 }
