@@ -6,8 +6,6 @@ use tracing::{error, info, warn};
 
 use crate::{data_value::LogData, ApiError, ReqwestBadResponse};
 
-const LOG_BATCH_SIZE: usize = 32;
-
 pub struct Run {
     tx_log_data: mpsc::Sender<RunMessage>,
 }
@@ -27,35 +25,22 @@ async fn submit_log(
     client: &reqwest::Client,
     run_path: &str,
     step: u64,
-    rows: &[LogData],
+    row: LogData,
 ) -> Result<(), ApiError> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-
-    let mut content = Vec::with_capacity(rows.len());
-    for row in rows {
-        content.push(serde_json::to_string(row)?);
-    }
-
-    let summary_row = content
-        .last()
-        .expect("content should not be empty")
-        .clone();
-
+    let row_string = serde_json::to_string(&row)?;
     let log = FsFilesData {
         files: [
             (
                 "wandb-history.jsonl".to_string(),
                 FsChunkData {
-                    content,
+                    content: vec![row_string.clone()],
                     offset: step,
                 },
             ),
             (
                 "wandb-summary.json".to_string(),
                 FsChunkData {
-                    content: vec![summary_row],
+                    content: vec![row_string.clone()],
                     offset: 0,
                 },
             ),
@@ -87,35 +72,19 @@ impl Run {
         project: String,
         name: String,
     ) -> Run {
-        let (tx_log_data, mut rx_log_data) = mpsc::channel::<RunMessage>(512);
+        let (tx_log_data, mut rx_log_data) = mpsc::channel::<RunMessage>(10);
         let log_thread: JoinHandle<Result<(), ApiError>> = tokio::spawn(async move {
             let run_path = format!("{base_url}/files/{entity}/{project}/{name}/file_stream");
             let mut step = 0;
-            let mut buffer: Vec<LogData> = Vec::with_capacity(LOG_BATCH_SIZE);
             while let Some(message) = rx_log_data.recv().await {
                 match message {
                     RunMessage::LogData(row) => {
-                        buffer.push(row);
-                        if buffer.len() >= LOG_BATCH_SIZE {
-                            let batch = std::mem::take(&mut buffer);
-                            if let Err(log_error) =
-                                submit_log(&client, &run_path, step, &batch).await
-                            {
-                                error!(
-                                    "Failed to log batch to WandB for step {step}: {log_error}"
-                                );
-                            }
-                            step += batch.len() as u64;
+                        if let Err(log_error) = submit_log(&client, &run_path, step, row).await {
+                            error!("Failed to log row to WandB for step {step}: {log_error}");
                         }
                     }
                 }
-            }
-            if !buffer.is_empty() {
-                let batch = std::mem::take(&mut buffer);
-                if let Err(log_error) = submit_log(&client, &run_path, step, &batch).await {
-                    error!("Failed to log batch to WandB for step {step}: {log_error}");
-                }
-                step += batch.len() as u64;
+                step += 1;
             }
             info!("WandB run {name} ended.");
             Ok(())
