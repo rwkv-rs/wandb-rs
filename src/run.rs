@@ -14,7 +14,7 @@ const LOG_RETRY_MAX_DELAY_MS: u64 = 5_000;
 
 
 pub struct Run {
-    tx_log_data: mpsc::Sender<RunMessage>,
+    tx_log_data: Option<mpsc::Sender<RunMessage>>,
     log_thread: Option<JoinHandle<Result<(), ApiError>>>,
 }
 
@@ -188,14 +188,14 @@ impl Run {
             Ok(())
         });
         Run {
-            tx_log_data,
+            tx_log_data: Some(tx_log_data),
             log_thread: Some(log_thread),
         }
     }
 
     pub async fn finish(mut self) -> Result<(), ApiError> {
         let log_thread = self.log_thread.take();
-        drop(self.tx_log_data);
+        drop(self.tx_log_data.take());
         if let Some(log_thread) = log_thread {
             log_thread.await??;
         }
@@ -274,14 +274,19 @@ impl Run {
         self._log(row.into()).await
     }
     async fn _log(&self, row: LogData) {
-        if let Err(e) = self.tx_log_data.send(RunMessage::LogData(row)).await {
-            warn!("Failed to send log data to wandb: {}", e);
+        if let Some(tx_log_data) = self.tx_log_data.as_ref() {
+            if let Err(e) = tx_log_data.send(RunMessage::LogData(row)).await {
+                warn!("Failed to send log data to wandb: {}", e);
+            }
+        } else {
+            warn!("Failed to send log data to wandb: logger already finished");
         }
     }
 }
 
 impl Drop for Run {
     fn drop(&mut self) {
+        drop(self.tx_log_data.take());
         if let Some(log_thread) = self.log_thread.take() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
