@@ -6,7 +6,7 @@ use tracing::{error, info, warn};
 
 use crate::{data_value::LogData, ApiError, ReqwestBadResponse};
 
-const LOG_BATCH_SIZE: usize = 64;
+const LOG_BATCH_SIZE: usize = 32;
 
 pub struct Run {
     tx_log_data: mpsc::Sender<RunMessage>,
